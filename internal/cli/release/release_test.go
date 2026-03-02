@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rudrankriyam/App-Store-Connect-CLI/internal/asc"
 	"github.com/rudrankriyam/App-Store-Connect-CLI/internal/cli/metadata"
@@ -347,5 +348,136 @@ func TestExecuteRun_IdempotentWhenSubmissionExists(t *testing.T) {
 		if strings.HasPrefix(req, "POST /v1/reviewSubmissions") || strings.HasPrefix(req, "POST /v1/reviewSubmissionItems") {
 			t.Fatalf("expected idempotent path without new submission creation, saw %q", req)
 		}
+	}
+}
+
+func TestExecuteRun_DryRunReportsDryRunForAllSteps(t *testing.T) {
+	origClientFactory := releaseClientFactory
+	origMetadataExecutor := metadataPushExecutor
+	origReadinessBuilder := readinessReportBuilder
+	origTransport := http.DefaultTransport
+	t.Cleanup(func() {
+		releaseClientFactory = origClientFactory
+		metadataPushExecutor = origMetadataExecutor
+		readinessReportBuilder = origReadinessBuilder
+		http.DefaultTransport = origTransport
+	})
+
+	http.DefaultTransport = releaseRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch {
+		case req.Method == http.MethodGet && req.URL.Path == "/v1/apps/APP_123/appStoreVersions":
+			return releaseJSONResponse(http.StatusOK, `{"data":[{"type":"appStoreVersions","id":"VERSION_123","attributes":{"versionString":"2.4.0","platform":"IOS","appStoreState":"PREPARE_FOR_SUBMISSION"}}]}`)
+		case req.Method == http.MethodGet && req.URL.Path == "/v1/appStoreVersions/VERSION_123/build":
+			return releaseJSONResponse(http.StatusNotFound, `{"errors":[{"status":"404","code":"NOT_FOUND","title":"Not Found"}]}`)
+		case req.Method == http.MethodGet && req.URL.Path == "/v1/appStoreVersions/VERSION_123/appStoreVersionSubmission":
+			return releaseJSONResponse(http.StatusNotFound, `{"errors":[{"status":"404","code":"NOT_FOUND","title":"Not Found"}]}`)
+		default:
+			return nil, fmt.Errorf("unexpected request: %s %s", req.Method, req.URL.Path)
+		}
+	})
+
+	testClient := newReleaseTestClient(t)
+	releaseClientFactory = func() (*asc.Client, error) { return testClient, nil }
+	metadataPushExecutor = func(_ context.Context, _ metadata.PushExecutionOptions) (metadata.PushPlanResult, error) {
+		return metadata.PushPlanResult{}, nil
+	}
+	readinessReportBuilder = func(_ context.Context, _ validatecli.ReadinessOptions) (validation.Report, error) {
+		return validation.Report{
+			AppID:     "APP_123",
+			VersionID: "VERSION_123",
+			Summary:   validation.Summary{Blocking: 0},
+		}, nil
+	}
+
+	result, err := executeRun(context.Background(), runOptions{
+		AppID:          "APP_123",
+		Version:        "2.4.0",
+		BuildID:        "BUILD_123",
+		MetadataDir:    "./metadata/version/2.4.0",
+		Platform:       "IOS",
+		DryRun:         true,
+		Confirm:        false,
+		StrictValidate: false,
+		CheckpointFile: filepath.Join(t.TempDir(), "release-checkpoint.json"),
+	})
+	if err != nil {
+		t.Fatalf("executeRun error: %v", err)
+	}
+	if result.Status != "dry-run" {
+		t.Fatalf("expected result status dry-run, got %q", result.Status)
+	}
+	if len(result.Steps) != 5 {
+		t.Fatalf("expected 5 steps, got %d", len(result.Steps))
+	}
+	for i, step := range result.Steps {
+		if step.Status != "dry-run" {
+			t.Fatalf("expected step %d status dry-run, got %q", i, step.Status)
+		}
+	}
+}
+
+func TestExecuteRun_UsesLongDefaultTimeout(t *testing.T) {
+	t.Setenv("ASC_TIMEOUT", "")
+
+	origClientFactory := releaseClientFactory
+	origMetadataExecutor := metadataPushExecutor
+	origReadinessBuilder := readinessReportBuilder
+	origTransport := http.DefaultTransport
+	t.Cleanup(func() {
+		releaseClientFactory = origClientFactory
+		metadataPushExecutor = origMetadataExecutor
+		readinessReportBuilder = origReadinessBuilder
+		http.DefaultTransport = origTransport
+	})
+
+	http.DefaultTransport = releaseRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch {
+		case req.Method == http.MethodGet && req.URL.Path == "/v1/apps/APP_123/appStoreVersions":
+			return releaseJSONResponse(http.StatusOK, `{"data":[{"type":"appStoreVersions","id":"VERSION_123","attributes":{"versionString":"2.4.0","platform":"IOS","appStoreState":"PREPARE_FOR_SUBMISSION"}}]}`)
+		case req.Method == http.MethodGet && req.URL.Path == "/v1/appStoreVersions/VERSION_123/build":
+			return releaseJSONResponse(http.StatusNotFound, `{"errors":[{"status":"404","code":"NOT_FOUND","title":"Not Found"}]}`)
+		case req.Method == http.MethodGet && req.URL.Path == "/v1/appStoreVersions/VERSION_123/appStoreVersionSubmission":
+			return releaseJSONResponse(http.StatusNotFound, `{"errors":[{"status":"404","code":"NOT_FOUND","title":"Not Found"}]}`)
+		default:
+			return nil, fmt.Errorf("unexpected request: %s %s", req.Method, req.URL.Path)
+		}
+	})
+
+	testClient := newReleaseTestClient(t)
+	releaseClientFactory = func() (*asc.Client, error) { return testClient, nil }
+
+	remainingTimeout := time.Duration(0)
+	metadataPushExecutor = func(ctx context.Context, _ metadata.PushExecutionOptions) (metadata.PushPlanResult, error) {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("expected request context deadline")
+		}
+		remainingTimeout = time.Until(deadline)
+		return metadata.PushPlanResult{}, nil
+	}
+	readinessReportBuilder = func(_ context.Context, _ validatecli.ReadinessOptions) (validation.Report, error) {
+		return validation.Report{
+			AppID:     "APP_123",
+			VersionID: "VERSION_123",
+			Summary:   validation.Summary{Blocking: 0},
+		}, nil
+	}
+
+	_, err := executeRun(context.Background(), runOptions{
+		AppID:          "APP_123",
+		Version:        "2.4.0",
+		BuildID:        "BUILD_123",
+		MetadataDir:    "./metadata/version/2.4.0",
+		Platform:       "IOS",
+		DryRun:         true,
+		Confirm:        false,
+		StrictValidate: false,
+		CheckpointFile: filepath.Join(t.TempDir(), "release-checkpoint.json"),
+	})
+	if err != nil {
+		t.Fatalf("executeRun error: %v", err)
+	}
+	if remainingTimeout <= 20*time.Minute {
+		t.Fatalf("expected long timeout budget, got %s", remainingTimeout)
 	}
 }

@@ -25,6 +25,7 @@ const (
 	stepAttachBuild       = "attach_build"
 	stepValidateReadiness = "validate_readiness"
 	stepSubmitReview      = "submit_review"
+	releaseDefaultTimeout = 30 * time.Minute
 )
 
 var (
@@ -249,7 +250,7 @@ func executeRun(ctx context.Context, opts runOptions) (runResult, error) {
 		return result, err
 	}
 
-	requestCtx, cancel := shared.ContextWithTimeout(ctx)
+	requestCtx, cancel := shared.ContextWithTimeoutDuration(ctx, resolveReleaseTimeout())
 	defer cancel()
 
 	versionID := strings.TrimSpace(checkpoint.VersionID)
@@ -520,8 +521,12 @@ func executeRun(ctx context.Context, opts runOptions) (runResult, error) {
 			}, fmt.Errorf("validate readiness: found %d blocking issue(s)", report.Summary.Blocking)
 		}
 
+		status := "ok"
+		if opts.DryRun {
+			status = "dry-run"
+		}
 		return stepOutcome{
-			Status:  "ok",
+			Status:  status,
 			Message: "readiness checks passed",
 			Details: map[string]any{"report": report},
 			Persist: !opts.DryRun,
@@ -632,6 +637,10 @@ func cancelStaleReviewSubmissions(ctx context.Context, client *asc.Client, appID
 		}
 	}
 	return warnings
+}
+
+func resolveReleaseTimeout() time.Duration {
+	return asc.ResolveTimeoutWithDefault(releaseDefaultTimeout)
 }
 
 func defaultCheckpointPath(appID, version, buildID, platform string) string {
